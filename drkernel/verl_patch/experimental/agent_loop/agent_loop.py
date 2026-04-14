@@ -423,8 +423,14 @@ class AgentLoopWorker:
             sampling_params["temperature"] = config.val_kwargs.temperature
 
         # by default, we assume it's a single turn agent
+        # Override via config: actor_rollout_ref.rollout.agent.default_agent_name=<registered_name>
+        # (used by the claw_container port to force every sample into the container-agent loop
+        #  without having to modify the parquet schema).
+        default_agent_name = self.config.actor_rollout_ref.rollout.agent.get(
+            "default_agent_name", "single_turn_agent"
+        )
         if "agent_name" not in batch.non_tensor_batch:
-            batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(batch), dtype=object)
+            batch.non_tensor_batch["agent_name"] = np.array([default_agent_name] * len(batch), dtype=object)
 
         if "index" in batch.non_tensor_batch:
             index = batch.non_tensor_batch["index"]
@@ -442,6 +448,36 @@ class AgentLoopWorker:
         outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(outputs)
+
+        # Forward dataset-level non_tensor_batch fields (e.g. uid, data_source, reward_model)
+        # that the trainer expects in the output DataProto. The agent-loop _postprocess only
+        # produces __num_turns__ and reward_extra_info; the trainer (kernel_trainer) also
+        # needs uid for sample-matching when some samples time out.
+        for key in batch.non_tensor_batch:
+            if key not in output.non_tensor_batch:
+                output.non_tensor_batch[key] = batch.non_tensor_batch[key]
+
+        # DR.Kernel's multi-turn advantage code expects a sample-level loss_mask
+        # with shape [batch]. The token-level response_mask still controls which
+        # generated tokens receive loss.
+        if "loss_mask" not in output.batch:
+            output.batch["loss_mask"] = output.batch["response_mask"].sum(dim=-1).gt(0).to(
+                dtype=output.batch["response_mask"].dtype
+            )
+
+        # DR.Kernel's turn-aware advantage code expects one row per turn.
+        # The claw_container agent owns its multi-step interaction inside the
+        # container and returns one flat trajectory per sample, so expose it as
+        # the first valid turn (1-indexed, matching the vLLM multi-turn rollout).
+        batch_size = output.batch["responses"].shape[0]
+        output_device = output.batch["responses"].device
+        if "turn_indices" not in output.batch:
+            output.batch["turn_indices"] = torch.ones(batch_size, dtype=torch.long, device=output_device)
+        if "sample_indices" not in output.batch:
+            output.batch["sample_indices"] = torch.arange(batch_size, dtype=torch.long, device=output_device)
+        if "global_turn_indices" not in output.non_tensor_batch:
+            output.non_tensor_batch["global_turn_indices"] = np.zeros(batch_size, dtype=np.int32)
+
         return output
 
     async def _run_agent_loop(

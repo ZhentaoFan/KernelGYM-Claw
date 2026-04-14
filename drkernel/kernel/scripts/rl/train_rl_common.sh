@@ -106,6 +106,7 @@ LOSS_AGG_MODE=${LOSS_AGG_MODE:-"seq-mean-token-sum"}
 LOSS_SCALE_FACTOR=${LOSS_SCALE_FACTOR:-1000.0}
 
 REWARD_FUNC_NAME=${REWARD_FUNC_NAME:-"calculate_reward_weighted"}
+REFERENCE_BACKEND=${REFERENCE_BACKEND:-"pytorch"}
 SPEEDUP_REWARD_UPPER_BOUND=${SPEEDUP_REWARD_UPPER_BOUND:-3.0}
 SPEEDUP_REWARD_LOWER_BOUND=${SPEEDUP_REWARD_LOWER_BOUND:-1.0}
 
@@ -765,6 +766,7 @@ run_training() {
       actor_rollout_ref.ref.ulysses_sequence_parallel_size=$SP_SIZE\
       reward_model.enable=False \
       reward_model.reward_manager=$REWARD_MANAGER \
+      ++reward_model.reference_backend=$REFERENCE_BACKEND \
       reward_model.enhanced=$REWARD_ENHANCED \
       reward_model.use_sandbox_rate_limit=$REWARD_USE_SANDBOX_RATE_LIMIT \
       reward_model.server_url='"'$REWARD_SERVER_URL'"' \
@@ -822,7 +824,8 @@ run_training() {
       rejection_sampling.gate2.enabled=$GATE2_ENABLED \
       rejection_sampling.gate2.instability_threshold=$GATE2_INSTABILITY_THRESHOLD \
       rejection_sampling.log_rejected_samples=$LOG_REJECTED_SAMPLES \
-      rejection_sampling.save_rejection_stats=$SAVE_REJECTION_STATS
+      rejection_sampling.save_rejection_stats=$SAVE_REJECTION_STATS \
+      ${EXTRA_HYDRA_OVERRIDES:-}
 }
 
 # Main execution function

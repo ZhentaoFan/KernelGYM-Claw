@@ -1,0 +1,8 @@
+# Agent-loop registry config consumed by verl_patch.experimental.agent_loop.AgentLoopWorker.
+# Entries here extend/override the default @register("...")-populated registry.
+#
+# Pass via:  actor_rollout_ref.rollout.agent.agent_loop_config_path=<this file>
+# Select per-sample via non_tensor_batch["agent_name"]="claw_container" (see
+# 8b_claw_container_agent_local.sh for how we force-assign it).
+- name: claw_container
+  _target_: verl_patch.experimental.agent_loop.claw_container_agent.ClawContainerAgentLoop

@@ -76,6 +76,24 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+def ensure_sample_loss_mask(data: DataProto) -> None:
+    """Ensure ``loss_mask`` is sample-level [batch] for DR.Kernel advantage code."""
+    if "loss_mask" in data.batch:
+        loss_mask = data.batch["loss_mask"]
+        if loss_mask.dim() == 1:
+            return
+        if loss_mask.dim() == 2:
+            data.batch["loss_mask"] = loss_mask.sum(dim=-1).gt(0).to(dtype=loss_mask.dtype)
+            return
+        raise ValueError(f"Expected `loss_mask` to be 1-D or 2-D, got shape {tuple(loss_mask.shape)}")
+
+    if "response_mask" not in data.batch:
+        return
+
+    response_mask = data.batch["response_mask"]
+    data.batch["loss_mask"] = response_mask.sum(dim=-1).gt(0).to(dtype=response_mask.dtype)
+
+
 def apply_loss_mask_to_masks(data: DataProto) -> None:
     """Zero out response and attention masks for loss-masked samples.
 
@@ -1855,6 +1873,16 @@ class RayKernelTrainer(RayPPOTrainer):
                 reward_fn=self.reward_fn,
                 val_reward_fn=self.val_reward_fn,
             )
+        elif self.config.actor_rollout_ref.rollout.mode == "async_agent":
+            # Route rollout through the agent-loop registry (AgentLoopBase subclasses).
+            # Used by the claw_container agent and any future container/tool agents.
+            self.async_rollout_mode = True
+            from verl_patch.experimental.agent_loop.agent_loop import AgentLoopManager
+
+            self.async_rollout_manager = AgentLoopManager(
+                config=self.config,
+                worker_group=self.actor_rollout_wg,
+            )
 
         # IMPORTANT: This happens ONLY for sufficient batches (after buffering)
         # We find the maximum world_size across all worker groups to ensure compatibility
@@ -2014,13 +2042,9 @@ class RayKernelTrainer(RayPPOTrainer):
                     f"Warning: No sampler state found at {sampler_local_path}, sampler will start from initial state"
                 )
 
-        if self.config.actor_rollout_ref.rollout.mode == "async_agent":
-            self.async_rollout_mode = True
-            from verl_patch.experimental.agent_loop.agent_loop import AgentLoopManager
-
-            self.async_rollout_manager = AgentLoopManager(
-                config=self.config, worker_group=self.actor_rollout_wg,
-            )
+        # async_agent rollout manager is initialized in init_workers() (it was previously
+        # here by mistake, which meant fresh runs without a checkpoint never set up the
+        # AgentLoopManager and fell back to the base WorkerDict.generate_sequences path).
 
     def compute_pass_at_k(self, results: list[list[bool]], k: int):
         """
@@ -2573,7 +2597,7 @@ class RayKernelTrainer(RayPPOTrainer):
         """
         # Skip processing if rollout_log_probs are missing (no mismatch to correct)
         if "rollout_log_probs" not in batch.batch:
-            return batch, {}
+            return batch, {}, {}
 
         # Store original mask for quality analysis
         original_response_mask = batch.batch["response_mask"].clone()
@@ -2945,6 +2969,7 @@ class RayKernelTrainer(RayPPOTrainer):
                         )
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
+                    ensure_sample_loss_mask(batch)
                     if use_multi_turn:
                         # Apply loss mask for batch to avoid computing loss on padded turns
                         apply_loss_mask_to_masks(batch)
@@ -3124,6 +3149,7 @@ class RayKernelTrainer(RayPPOTrainer):
                                             extra_rewards_info[k] = values
 
                         # (TODO) Qian: we should be careful about here, to avoid "void turn" still getting non-zero rewards, we mask them here to zero
+                        ensure_sample_loss_mask(batch)
                         apply_loss_mask_to_rewards(batch)
 
                         # Extract last turn for filter stats update

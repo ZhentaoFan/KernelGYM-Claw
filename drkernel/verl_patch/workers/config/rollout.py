@@ -77,6 +77,10 @@ class AgentLoopConfig(BaseConfig):
     num_workers: int = 8
     agent_loop_config_path: Optional[str] = None
     custom_async_server: CustomAsyncServerConfig = field(default_factory=CustomAsyncServerConfig)
+    # Default agent_name used by AgentLoopWorker.generate_sequences when the batch
+    # doesn't carry one. Set to e.g. "claw_container" to route every sample into
+    # the container-agent loop without modifying the parquet schema.
+    default_agent_name: str = "single_turn_agent"
 
 
 @dataclass

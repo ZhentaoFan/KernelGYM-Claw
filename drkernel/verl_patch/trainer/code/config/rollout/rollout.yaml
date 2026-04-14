@@ -215,6 +215,11 @@ agent:
   #   max_terms: 6
   agent_loop_config_path: null
 
+  # Default agent_name used by AgentLoopWorker when a batch row does not carry one.
+  # Override to e.g. "claw_container" to route all samples through a registered
+  # container-agent loop without modifying the dataset schema.
+  default_agent_name: single_turn_agent
+
   # custom async server configs
   custom_async_server:
 

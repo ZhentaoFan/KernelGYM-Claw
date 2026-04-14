@@ -1,0 +1,4 @@
+# Empty tool config — no tools registered for ClawContainerAgentLoop (claw manages its own tools).
+# This file exists solely to make multi_turn.tool_config_path truthy, which enables
+# vLLM's enable_auto_tools=True + tool_parser in OpenAIServingChat.
+[]

@@ -18,8 +18,10 @@ Kernel 奖励管理器，专门用于 kernel code RL 训练
 """
 
 from collections import defaultdict
+import json
 import torch
 import logging
+from uuid import uuid4
 
 from verl import DataProto
 from verl.utils.reward_score import default_compute_score
@@ -187,13 +189,102 @@ class AsyncKernelRewardManager:
         
         return results
 
-    # def __call__(self, data: DataProto, return_dict: bool = False, **kwargs):
+    def _coerce_mapping(self, value):
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception:
+                return {}
+        if isinstance(value, dict):
+            return value
+        if hasattr(value, "item"):
+            try:
+                return self._coerce_mapping(value.item())
+            except Exception:
+                return {}
+        return {}
+
+    def _append_numeric_extra_info(self, target: dict, info: dict):
+        for key, value in info.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    continue
+                value = value.item()
+            if isinstance(value, (bool, int, float)):
+                target.setdefault(key, []).append(float(value))
+
+    def _call_dataproto(self, data: DataProto, return_dict: bool = True, **kwargs):
+        if "rm_scores" in data.batch.keys():
+            if return_dict:
+                return {"reward_tensor": data.batch["rm_scores"], "extra_info": {}}
+            return data.batch["rm_scores"]
+
+        response_ids_batch = data.batch["responses"]
+        reward_tensor = torch.zeros_like(response_ids_batch, dtype=torch.float32)
+
+        if "response_mask" in data.batch.keys():
+            valid_response_lengths = data.batch["response_mask"].sum(dim=-1)
+        else:
+            prompt_length = data.batch["prompts"].shape[-1]
+            valid_response_lengths = data.batch["attention_mask"][:, prompt_length:].sum(dim=-1)
+
+        reward_models = data.non_tensor_batch.get("reward_model", [{}] * len(data))
+        extra_infos = data.non_tensor_batch.get("extra_info", [{}] * len(data))
+        entry_points = data.non_tensor_batch.get("entry_point")
+        uuids = data.non_tensor_batch.get("uuid")
+        uid_values = data.non_tensor_batch.get("uid")
+
+        extra_info_dict = {}
+        for i in range(len(data)):
+            valid_len = int(valid_response_lengths[i].item())
+            valid_len = max(valid_len, 1)
+            valid_response_ids = response_ids_batch[i][:valid_len].detach().cpu().tolist()
+            response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+
+            reward_model = self._coerce_mapping(reward_models[i])
+            extra_info = self._coerce_mapping(extra_infos[i])
+            ground_truth = reward_model.get("ground_truth", "")
+
+            if entry_points is not None:
+                entry_point = entry_points[i]
+            else:
+                entry_point = extra_info.get("entry_point", "Model")
+
+            if uuids is not None:
+                uuid = uuids[i]
+            else:
+                uuid = (
+                    extra_info.get("uuid")
+                    or extra_info.get("problem_id")
+                    or (str(uid_values[i]) if uid_values is not None else None)
+                    or str(uuid4())
+                )
+
+            result = self.__call__(
+                valid_response_ids,
+                response_str,
+                ground_truth,
+                str(entry_point),
+                str(uuid),
+                return_dict=True,
+                response_length=response_ids_batch.shape[-1],
+                **kwargs,
+            )
+            sample_reward = result["reward_tensor"].to(reward_tensor.device)
+            copy_len = min(sample_reward.numel(), reward_tensor.shape[-1])
+            reward_tensor[i, :copy_len] = sample_reward[:copy_len]
+            self._append_numeric_extra_info(extra_info_dict, result.get("reward_extra_info", {}))
+
+        if return_dict:
+            return {"reward_tensor": reward_tensor, "extra_info": extra_info_dict}
+        return reward_tensor
+
     def __call__(self, 
-                response_ids: list[int], 
-                response_str: str, 
-                ground_truth: str, 
-                entry_point: str, 
-                uuid: str, 
+                response_ids: list[int] | DataProto,
+                response_str: str = None,
+                ground_truth: str = None,
+                entry_point: str = None,
+                uuid: str = None,
                 return_dict: bool = True,
                 return_full_state: bool = False,
                 **kwargs):
@@ -213,6 +304,9 @@ class AsyncKernelRewardManager:
         Returns:
             Reward tensor or a dictionary containing reward information
         """
+        if isinstance(response_ids, DataProto) and response_str is None:
+            return self._call_dataproto(response_ids, return_dict=return_dict, **kwargs)
+
         # 如果已经有 rm_scores，直接返回
         # if "rm_scores" in data.batch.keys():
         #     if return_dict:

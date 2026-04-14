@@ -59,7 +59,15 @@ from verl_patch.workers.code.agent_env import (
     FinishReasonTypeEnum,
     create_environment,
 )
-from verl_patch.workers.code.reward_manager import CodeRewardManager, MathRewardManager
+from verl_patch.workers.code.reward_manager import CodeRewardManager
+try:
+    # Optional: math_verify package is not always installed. When it's missing the
+    # reward_manager __init__ doesn't export MathRewardManager. The isinstance check
+    # on self.reward_fn against None is always False, which is the desired no-op
+    # behavior for non-math runs (e.g., DR.Kernel's kernel_async path).
+    from verl_patch.workers.code.reward_manager import MathRewardManager
+except ImportError:
+    MathRewardManager = None  # type: ignore[assignment]
 from collections import defaultdict
 import re
 
@@ -506,7 +514,7 @@ class AsyncvLLMEngine:
         for i, (messages, tokens) in enumerate(zip(raw_prompts, tokens_ids)):
             if not isinstance(messages, list):
                 messages = messages.tolist()
-            if isinstance(self.reward_fn, MathRewardManager):
+            if MathRewardManager is not None and isinstance(self.reward_fn, MathRewardManager):
                 extra_info = {
                     'ground_truth': prompts[i].non_tensor_batch['reward_model']['ground_truth'],
                     'data_source': prompts[i].non_tensor_batch['data_source'],

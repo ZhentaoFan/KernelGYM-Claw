@@ -1,2 +1,14 @@
 data/
 .claude/
+__pycache__/
+*.py[cod]
+.venv/
+.cache/
+logs/
+tmp/
+checkpoints/
+models/
+drkernel/outputs/
+drkernel/wandb/
+kernelgym/logs/
+*.whl
