@@ -2,28 +2,34 @@
 
 最后更新: 2026-04-14 UTC
 
-这份文档记录 DR.Kernel 里接入 "container as an agent" 的改动。当前目标是让每个 rollout sample 启动一个独立 docker container，container 里运行专业 agent `claw`，`claw` 通过 OpenAI-compatible API 调训练侧 vLLM 生成 token，结束后把 Claw session 转回 VERL/DR.Kernel trainer 能训练的 `response_ids`、`response_mask`、`loss_mask` 和 reward 输入。
+这份文档记录 DR.Kernel 里接入 "container as an agent" 的改动。当前目标是让每个 rollout sample 启动一个独立 docker container，container 里运行专业 agent `claw`，`claw` 通过 OpenAI-compatible API 调训练侧 vLLM 生成 token，并通过 container 内注册的 `evaluate_kernel` tool 主动调用 KernelGYM 获取 compile/correctness/speedup feedback。结束后把 Claw session 转回 VERL/DR.Kernel trainer 能训练的 `response_ids`、`response_mask`、`loss_mask` 和 reward 输入。
 
-## 当前运行方式
+## 当前运行状态
 
-这个分支提供的是可复用 launcher，不绑定某一台机器上的历史 run。默认路径都可以通过环境变量覆盖，推荐先看同目录下的 [INSTALL_CLAW_CONTAINER_AGENT.md](INSTALL_CLAW_CONTAINER_AGENT.md)。
+当前正式 run 的日志路径:
+
+```bash
+/home/ubuntu/z84318463/logs/drkernel_rl/drkernel_claw_trace_20260414T144042Z.log
+```
+
+这个 run 是调试 launcher 时用 `bash -x` 拉起的，但实际训练配置已经是正式配置。最近日志中能看到 `ClawContainer step ... done`，GPU 4-7 上的 vLLM/训练 worker 也在跑。
 
 当前使用资源:
 
 | 资源 | 用途 |
 | --- | --- |
-| GPU 2,3 | KernelGYM kernel worker/server |
-| GPU 4,5,6,7 | DR.Kernel rollout + training |
+| GPU 3,4,5 | KernelGYM kernel worker/server |
+| GPU 6,7 | DR.Kernel rollout + training |
 | docker network | `host` |
-| Claw workspace | `${CLAW_WORKSPACE_ROOT:-$ROOT_DIR/tmp/claw_drkernel_rollouts}` |
+| Claw workspace | `/home/ubuntu/z84318463/tmp/claw_drkernel_rollouts` |
 
 下次正常启动可以用:
 
 ```bash
-cd /path/to/KernelGYM-Claw
+cd /home/ubuntu/z84318463
 mkdir -p logs/drkernel_rl
 LOG=logs/drkernel_rl/drkernel_claw_full_$(date -u +%Y%m%dT%H%M%SZ).log
-nohup bash drkernel/kernel/scripts/rl/8b_claw_container_agent_local.sh > "$LOG" 2>&1 &
+nohup bash third_party/KernelGYM/drkernel/kernel/scripts/rl/8b_claw_container_agent_local.sh > "$LOG" 2>&1 &
 echo "$LOG"
 ```
 
@@ -37,20 +43,22 @@ DR.Kernel trainer 不直接生成单段文本，而是把每个 rollout sample �
 2. `kernel_trainer.py` 在初始化 worker 时创建 `AgentLoopManager`。
 3. `AgentLoopWorker` 收到一个 rollout sample 后，把它路由到 `ClawContainerAgentLoop`。
 4. `ClawContainerAgentLoop` 为这个 sample 建 workspace，写 prompt 和 container entrypoint。
-5. 宿主机执行 `docker run --rm --network host -v <workspace>:/workspace ... claw-agent-runtime:latest`。
-6. container 内先启动 OpenAI-compatible proxy，再执行 `claw --output-format json ... prompt "$PROMPT"`。
-7. Claw 每次需要模型输出时，请求 container 内 proxy；proxy 根据剩余 token budget 限制 `max_tokens`，再转发给训练侧 vLLM。
-8. Claw 退出后，host 侧读取 `claw_result.json`、`claw_stderr.log` 和 `.claw/sessions/*.jsonl`。
-9. 代码把 Claw session 里的 assistant/tool 轨迹渲染为训练 response，并按 tokenizer/chat template 做增量 tokenize。
-10. `AgentLoopOutput` 返回 `response_ids`、`response_mask`、`loss_mask`、`turn_indices` 等字段。
-11. DR.Kernel reward manager decode response，调用 KernelGYM evaluate，返回 reward tensor 和 extra metrics。
-12. Trainer 用这些 rollout batch 做 PPO/update/save/eval。
+5. `_prepare_workspace` 写入 prompt、OpenAI proxy、`kernelgym_context.json` 和本地 Claw plugin `kernelgym-evaluator`。
+6. 宿主机执行 `docker run --rm --network host -v <workspace>:/workspace ... claw-agent-runtime:latest`。
+7. container 内先启动 OpenAI-compatible proxy，再执行 `claw --output-format json ... prompt "$PROMPT"`。
+8. Claw 每次需要模型输出时，请求 container 内 proxy；proxy 根据剩余 token budget 限制 `max_tokens`，再转发给训练侧 vLLM。
+9. Claw 可以主动调用 plugin tool `evaluate_kernel`；该工具把候选 `kernel_code` 和隐藏 reference/entry_point 发送到 KernelGYM `/evaluate`，再把结果作为 tool_result 注入 Claw conversation。
+10. Claw 退出后，host 侧读取 `claw_result.json`、`claw_stderr.log` 和 `.claw/sessions/*.jsonl`。
+11. 代码把 Claw session 里的 assistant/tool 轨迹渲染为训练 response，并按 tokenizer/chat template 做增量 tokenize。
+12. `AgentLoopOutput` 返回 `response_ids`、`response_mask`、`loss_mask`、`turn_indices` 等字段。
+13. DR.Kernel reward manager 仍会 decode 最终 response，再调用 KernelGYM evaluate 计算 trainer 的最终 reward tensor 和 extra metrics。
+14. Trainer 用这些 rollout batch 做 PPO/update/save/eval。
 
 ## 关键文件清单
 
 | 文件 | 改动作用 |
 | --- | --- |
-| [../../../verl_patch/experimental/agent_loop/claw_container_agent.py](../../../verl_patch/experimental/agent_loop/claw_container_agent.py) | 新增 `ClawContainerAgentLoop`，负责每个 sample 一个 docker container、Claw 启动、proxy 转发、session 读取、轨迹 tokenize、返回 `AgentLoopOutput`。 |
+| [../../../verl_patch/experimental/agent_loop/claw_container_agent.py](../../../verl_patch/experimental/agent_loop/claw_container_agent.py) | 新增 `ClawContainerAgentLoop`，负责每个 sample 一个 docker container、Claw 启动、proxy 转发、注册 `evaluate_kernel` plugin、session 读取、轨迹 tokenize、返回 `AgentLoopOutput`。 |
 | [../../../verl_patch/experimental/agent_loop/__init__.py](../../../verl_patch/experimental/agent_loop/__init__.py) | import `ClawContainerAgentLoop`，让 `@register("claw_container")` 生效。 |
 | [../../../verl_patch/experimental/agent_loop/agent_loop.py](../../../verl_patch/experimental/agent_loop/agent_loop.py) | 增加 `default_agent_name` fallback，不需要改 parquet schema 也能强制全量样本走 `claw_container`；同时补齐 sample-level loss/turn metadata。 |
 | [../../kernel_trainer.py](../../kernel_trainer.py) | 在 `async_agent` 路径初始化 `AgentLoopManager`；补 `ensure_sample_loss_mask`；兼容缺失 rollout logprobs 的分支；在 reward loss mask 前保证 sample mask 存在。 |
@@ -73,6 +81,8 @@ DR.Kernel trainer 不直接生成单段文本，而是把每个 rollout sample �
 | env knobs | 读取 `CLAW_AGENT_IMAGE`、`CLAW_WORKSPACE_ROOT`、`CLAW_MAX_COMPLETION_TOKENS`、`CLAW_CONCURRENCY`、`CLAW_AGENT_TIMEOUT_SEC` 等环境变量。 |
 | `OPENAI_COMPAT_PROXY_SCRIPT` | 写进 container 的本地 proxy。它接收 Claw 的 OpenAI-compatible 请求，限制剩余 completion token，再转发给训练侧 vLLM。 |
 | `_container_entrypoint_script` | container 内入口脚本。启动 proxy，设置 `OPENAI_BASE_URL`，执行 `claw --output-format json --permission-mode danger-full-access --dangerously-skip-permissions --model "$CLAW_MODEL" prompt "$PROMPT"`。 |
+| `KERNELGYM_EVALUATE_TOOL_SCRIPT` | 写进 workspace 的 plugin tool 脚本。读取隐藏 `kernelgym_context.json`，把 Claw 提供的 `kernel_code` POST 到 KernelGYM `/evaluate`，返回 compile/correctness/speedup feedback。 |
+| `_write_kernelgym_plugin` | 给每个 workspace 写 `.claw/settings.json`、`claw_plugins/kernelgym-evaluator/.claude-plugin/plugin.json` 和 `tools/evaluate_kernel.py`。 |
 | `_load_latest_session` | 读取 workspace 下最新 `.claw/sessions/*.jsonl`，拿到 Claw 实际对话轨迹。 |
 | `_render_claw_turns` | 把 Claw session message 转成训练侧可 tokenize 的 role/content turn，包含 tool_use/tool_result 的文本化。 |
 | `_run_claw_container_blocking` | host 侧实际执行 docker container，处理 timeout、kill、stdout/stderr 和 artifact 路径。 |
@@ -92,6 +102,9 @@ DR.Kernel trainer 不直接生成单段文本，而是把每个 rollout sample �
 | `MAX_RESPONSE_LENGTH` | `8192` | trainer 侧最大 response token。 |
 | `CLAW_MAX_COMPLETION_TOKENS` | `8192` | container proxy 对单个 sample 的 completion token budget。 |
 | `CLAW_CONCURRENCY` | `8` | 同时运行的 Claw container 数。 |
+| `CLAW_KERNELGYM_MAX_EVALS` | `3` | 每个 Claw rollout 内最多主动调用 `evaluate_kernel` 的次数。 |
+| `CLAW_KERNELGYM_NUM_PERF_TRIALS` | `20` | Claw tool-in-loop 反馈用的 perf trials；最终 trainer reward 仍使用 `NUM_PERF_TRIALS`。 |
+| `CLAW_KERNELGYM_NUM_CORRECT_TRIALS` | `5` | Claw tool-in-loop 反馈用的 correctness trials。 |
 | `SP_SIZE` | `4` | actor sequence parallel size。 |
 | `ROLLOUT_GPU_MEMORY_UTIL` | `0.75` | vLLM GPU memory utilization。 |
 | `VAL_BEFORE_TRAIN` | `True` | 训练前先跑 validation，所以启动早期会看到大量 eval containers。 |
@@ -104,7 +117,7 @@ DR.Kernel trainer 不直接生成单段文本，而是把每个 rollout sample �
 每个 sample 都有一个 host workspace，默认在:
 
 ```bash
-${CLAW_WORKSPACE_ROOT:-$ROOT_DIR/tmp/claw_drkernel_rollouts}/claw-drkernel-*
+/home/ubuntu/z84318463/tmp/claw_drkernel_rollouts/claw-drkernel-*
 ```
 
 常见文件:
@@ -114,6 +127,8 @@ ${CLAW_WORKSPACE_ROOT:-$ROOT_DIR/tmp/claw_drkernel_rollouts}/claw-drkernel-*
 | `prompt.txt` | host 写入 | 给 Claw 的任务输入。 |
 | `entrypoint.sh` | host 写入 | container 内执行脚本。 |
 | `openai_proxy.py` | host 写入 | container 内 proxy 代码。 |
+| `kernelgym_context.json` | host 写入 | 隐藏传给 `evaluate_kernel` 的 reference/entry_point/uuid，不需要暴露给模型文本。 |
+| `claw_plugins/kernelgym-evaluator/` | host 写入 | 每个 workspace 的本地 Claw plugin，注册 `evaluate_kernel` tool。 |
 | `claw_result.json` | Claw CLI 输出 | 优先提取最终 message。 |
 | `claw_stderr.log` | Claw CLI stderr | debug Claw 失败原因。 |
 | `.claw/sessions/*.jsonl` | Claw runtime 写入 | 训练轨迹主来源，记录 assistant/tool 对话。 |
@@ -159,7 +174,7 @@ ENABLE_MULTI_TURN=False
 看当前 formal run 日志:
 
 ```bash
-LOG=${LOG:-logs/drkernel_rl/drkernel_claw_full_latest.log}
+LOG=$(cat /home/ubuntu/z84318463/tmp/drkernel_claw_full_logpath.txt)
 tail -f "$LOG"
 ```
 
@@ -184,7 +199,7 @@ nvidia-smi
 检查最近错误:
 
 ```bash
-LOG=${LOG:-logs/drkernel_rl/drkernel_claw_full_latest.log}
+LOG=$(cat /home/ubuntu/z84318463/tmp/drkernel_claw_full_logpath.txt)
 grep -Ei 'Traceback|Error executing|RuntimeError|CUDA Error|out of memory|AssertionError|KeyError|ValueError' "$LOG" | tail -80
 ```
 

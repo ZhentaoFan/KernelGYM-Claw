@@ -5,7 +5,7 @@
 # the training-side vLLM via an in-container OpenAI-compat proxy.
 #
 # Before running:
-#   - KernelGYM server should already be up on ${KERNELGYM_SERVER_URL} (GPU 2,3)
+#   - KernelGYM server should already be up on ${KERNELGYM_SERVER_URL} (default: GPU 3,4,5)
 #   - `claw-agent-runtime:latest` docker image must be present on the host
 #   - Host must have docker CLI reachable and the current user able to run docker
 #   - GPUs 4,5,6,7 should be free (we use them for training + rollout as usual)
@@ -18,7 +18,7 @@ set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
-ENV_DIR="${ENV_DIR:-${ROOT_DIR}/.venv/drkernel310}"
+ENV_DIR="${ENV_DIR:-/home/ubuntu/z84318463/envs/drkernel310}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 export PATH="${ENV_DIR}/bin:${PATH}"
@@ -34,17 +34,29 @@ export ARNOLD_WORKER_GPU="${ARNOLD_WORKER_GPU:-4}"
 export N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-4}"
 export KERNELGYM_SERVER_URL="${KERNELGYM_SERVER_URL:-http://127.0.0.1:10907}"
 export HDFS_DATA_PATH="${HDFS_DATA_PATH:-${ROOT_DIR}/drkernel/data}"
-export HDFS_CHECKPOINT_PATH="${HDFS_CHECKPOINT_PATH:-${ROOT_DIR}/checkpoints/drkernel}"
+export HDFS_CHECKPOINT_PATH="${HDFS_CHECKPOINT_PATH:-/home/ubuntu/z84318463/checkpoints/drkernel}"
 
 # ---- claw-container agent env (consumed by ClawContainerAgentLoop) -----------
 export CLAW_AGENT_IMAGE="${CLAW_AGENT_IMAGE:-claw-agent-runtime:latest}"
-export CLAW_WORKSPACE_ROOT="${CLAW_WORKSPACE_ROOT:-${ROOT_DIR}/tmp/claw_drkernel_rollouts}"
+export CLAW_WORKSPACE_ROOT="${CLAW_WORKSPACE_ROOT:-/home/ubuntu/z84318463/tmp/claw_drkernel_rollouts}"
 export CLAW_DOCKER_SOCKET="${CLAW_DOCKER_SOCKET:-/var/run/docker.sock}"
 export CLAW_CONTAINER_NETWORK="${CLAW_CONTAINER_NETWORK:-host}"
 export CLAW_MAX_COMPLETION_TOKENS="${CLAW_MAX_COMPLETION_TOKENS:-${MAX_RESPONSE_LENGTH:-8192}}"
+export CLAW_FIRST_REQUEST_MAX_TOKENS="${CLAW_FIRST_REQUEST_MAX_TOKENS:-4096}"
+export CLAW_FOLLOWUP_REQUEST_MAX_TOKENS="${CLAW_FOLLOWUP_REQUEST_MAX_TOKENS:-3072}"
+# Leave empty by default so Claw can first write solution.py, then call evaluate_kernel.
+# Set CLAW_FORCE_FIRST_TOOL_NAME=evaluate_kernel only for debugging tool-call plumbing.
+export CLAW_FORCE_FIRST_TOOL_NAME="${CLAW_FORCE_FIRST_TOOL_NAME:-}"
 export CLAW_CONCURRENCY="${CLAW_CONCURRENCY:-8}"
 export CLAW_AGENT_TIMEOUT_SEC="${CLAW_AGENT_TIMEOUT_SEC:-900}"
 export CLAW_MODEL_NAME="${CLAW_MODEL_NAME:-hkust-nlp/drkernel-8b-coldstart}"
+# In-container KernelGYM feedback used by the Claw plugin tool evaluate_kernel.
+# Final trainer rewards still use the reward_model.* settings below.
+export CLAW_KERNELGYM_MAX_EVALS="${CLAW_KERNELGYM_MAX_EVALS:-3}"
+export CLAW_KERNELGYM_TASK_TIMEOUT="${CLAW_KERNELGYM_TASK_TIMEOUT:-${REWARD_TASK_TIMEOUT:-300}}"
+export CLAW_KERNELGYM_TASK_TIMEOUT_CLIENT="${CLAW_KERNELGYM_TASK_TIMEOUT_CLIENT:-${REWARD_TASK_TIMEOUT_CLIENT:-2400}}"
+export CLAW_KERNELGYM_NUM_CORRECT_TRIALS="${CLAW_KERNELGYM_NUM_CORRECT_TRIALS:-5}"
+export CLAW_KERNELGYM_NUM_PERF_TRIALS="${CLAW_KERNELGYM_NUM_PERF_TRIALS:-20}"
 mkdir -p "${CLAW_WORKSPACE_ROOT}"
 
 cd "${ROOT_DIR}/drkernel"
@@ -52,7 +64,7 @@ cd "${ROOT_DIR}/drkernel"
 TRAIN_DATASET=("hkust-nlp/drkernel-rl-data")
 VALID_DATASET=("hkust-nlp/drkernel-validation-data")
 MODEL_NAME="${MODEL_NAME:-drkernel-8b-coldstart}"
-MODEL_PATH="${MODEL_PATH:-${ROOT_DIR}/models/hkust-nlp/drkernel-8b-coldstart}"
+MODEL_PATH="${MODEL_PATH:-/home/ubuntu/z84318463/models/hkust-nlp/drkernel-8b-coldstart}"
 
 RUN_NAME="${RUN_NAME:-drkernel-8b-claw-container}"
 REWARD_MANAGER=kernel_async
@@ -77,14 +89,14 @@ COVERAGE_REWARD_TYPE="time_coverage"
 COVERAGE_REWARD_WEIGHT=0.5
 COVERAGE_REWARD_ENABLE=True
 
-REWARD_TASK_TIMEOUT=300
-REWARD_TIMEOUT=1800
-REWARD_ACQUIRE_TIMEOUT=2400
-REWARD_MAX_CONCURRENT=32
-REWARD_MAX_RETRIES=3
+REWARD_TASK_TIMEOUT="${REWARD_TASK_TIMEOUT:-300}"
+REWARD_TIMEOUT="${REWARD_TIMEOUT:-1800}"
+REWARD_ACQUIRE_TIMEOUT="${REWARD_ACQUIRE_TIMEOUT:-2400}"
+REWARD_MAX_CONCURRENT="${REWARD_MAX_CONCURRENT:-32}"
+REWARD_MAX_RETRIES="${REWARD_MAX_RETRIES:-3}"
 REWARD_PRINT_STATUS=True
-NUM_PERF_TRIALS=100
-REWARD_TASK_TIMEOUT_CLIENT=2400
+NUM_PERF_TRIALS="${NUM_PERF_TRIALS:-100}"
+REWARD_TASK_TIMEOUT_CLIENT="${REWARD_TASK_TIMEOUT_CLIENT:-2400}"
 
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
 IS_GET_LAST_TURN=True
@@ -107,7 +119,11 @@ PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
 AUTOMATIC_OVERSAMPLING=False
 REJECTION_SAMPLE=True
 
-PPO_MICRO_TOKEN=null
+# Keep actor update and old/ref log-prob recomputation conservative for 8B
+# long Claw trajectories. The common script otherwise defaults old/ref logprob
+# to 2x PPO, which OOMs around 8K responses.
+PPO_MICRO_TOKEN="${PPO_MICRO_TOKEN:-8192}"
+LOG_PROB_MICRO_TOKEN="${LOG_PROB_MICRO_TOKEN:-8192}"
 CLIP_RATIO=0.2_0.28
 ENTROPY_CLIP_RATE=0.0
 GRAD_CLIP=1.0

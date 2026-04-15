@@ -661,7 +661,13 @@ setup_training_environment() {
   # set ppo micro token
   PPO_MICRO_TOKEN=$(generate_model_micro_token "$MODEL_NAME")
   echo "PPO_MICRO_TOKEN: $PPO_MICRO_TOKEN"
-  LOG_PROB_MICRO_TOKEN=$((PPO_MICRO_TOKEN * 2))
+  # Old/ref log-prob recomputation can need a smaller token budget than PPO
+  # update, especially for long agent trajectories where entropy keeps logits
+  # alive. Let task launchers override it instead of always doubling PPO.
+  if [ -z "${LOG_PROB_MICRO_TOKEN:-}" ]; then
+    LOG_PROB_MICRO_TOKEN=$((PPO_MICRO_TOKEN * 2))
+  fi
+  echo "LOG_PROB_MICRO_TOKEN: $LOG_PROB_MICRO_TOKEN"
   max_num_batched_tokens=$(expr $MAX_PROMPT_LENGTH + $MAX_RESPONSE_LENGTH + 1000)
 
   # calculate the sum of MAX_PROMPT_LENGTH and MAX_RESPONSE_LENGTH
