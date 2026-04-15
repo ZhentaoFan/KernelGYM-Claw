@@ -662,6 +662,11 @@ class AgentLoopWorker:
             rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
             rm_scores[torch.arange(response_mask.size(0)), response_length] = torch.tensor(scores, dtype=torch.float32)
             batch["rm_scores"] = rm_scores
+            # DR.Kernel trainer can skip reward_fn entirely when token_level_scores
+            # are already present. This is important for container-internal ReAct:
+            # feedback tokens are interleaved with assistant tokens, so re-decoding
+            # the mixed transcript in reward_fn is both redundant and fragile.
+            batch["token_level_scores"] = rm_scores
 
         non_tensor_batch = {
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
@@ -669,9 +674,10 @@ class AgentLoopWorker:
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        non_tensor_batch["reward_extra_info"] = np.array(reward_extra_infos, dtype=object)
+        reward_extra_keys = sorted({key for info in reward_extra_infos for key in info.keys()})
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            non_tensor_batch[key] = np.array([info.get(key) for info in reward_extra_infos], dtype=object)
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]

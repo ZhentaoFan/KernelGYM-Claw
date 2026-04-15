@@ -90,12 +90,14 @@ VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
 IS_GET_LAST_TURN=True
 
 # The container-agent (claw) owns multi-turn internally; the VERL trainer should
-# NOT try to expand/repeat the batch for multi-turn, since the agent loop returns
-# flat results (one trajectory per sample). Keep this Claw-specific divergence
-# from 8b_trloo_mrs_pr_prs_local.sh, but restore the rest of the training-scale
-# hyperparameters below to match the original 8B launcher.
+# NOT try to expand/repeat the batch for multi-turn. The container entrypoint
+# now forces its own ReAct loop: claw -> extract code -> KernelGYM feedback ->
+# claw follow-up prompt. The agent loop still returns one flat trajectory per
+# sample, with feedback tokens masked out of policy loss.
 ENABLE_MULTI_TURN=False
 MAX_TURN=3
+export CLAW_REACT_MAX_TURNS="${CLAW_REACT_MAX_TURNS:-${MAX_TURN}}"
+export CLAW_REACT_STOP_ON_OK="${CLAW_REACT_STOP_ON_OK:-false}"
 N_VAL="${N_VAL:-2}"
 ACTOR_OPTIMIZER_OFFLOAD=True
 ACTOR_PARAMETER_OFFLOAD=True

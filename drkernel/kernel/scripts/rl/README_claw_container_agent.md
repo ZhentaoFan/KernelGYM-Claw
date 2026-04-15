@@ -1,8 +1,8 @@
 # DR.Kernel Claw Container Agent 集成说明
 
-最后更新: 2026-04-14 UTC
+最后更新: 2026-04-15 UTC
 
-这份文档记录 DR.Kernel 里接入 "container as an agent" 的改动。当前目标是让每个 rollout sample 启动一个独立 docker container，container 里运行专业 agent `claw`，`claw` 通过 OpenAI-compatible API 调训练侧 vLLM 生成 token，结束后把 Claw session 转回 VERL/DR.Kernel trainer 能训练的 `response_ids`、`response_mask`、`loss_mask` 和 reward 输入。
+这份文档记录 DR.Kernel 里接入 "container as an agent" 的改动。当前目标是让每个 rollout sample 启动一个独立 docker container，container 里运行专业 agent `claw`，`claw` 通过 OpenAI-compatible API 调训练侧 vLLM 生成 token。container entrypoint 会强制执行 ReAct 循环：`claw 生成候选代码 -> regex/solution.py 抽取 -> KernelGYM evaluate -> 把反馈作为下一轮 prompt 写回 claw`。结束后把 transcript 转回 VERL/DR.Kernel trainer 能训练的 `response_ids`、`response_mask`、reward 和 metrics。
 
 ## 当前运行方式
 
@@ -29,7 +29,7 @@ echo "$LOG"
 
 ## 一句话设计
 
-DR.Kernel trainer 不直接生成单段文本，而是把每个 rollout sample 交给 `ClawContainerAgentLoop`，由它启动一个 container，在 container 里运行 `claw`，Claw 经由 container 内的 OpenAI proxy 调训练侧 vLLM，最后把 `.claw/sessions/*.jsonl` 里的 agent 轨迹重新渲染并 tokenize 成训练样本。
+DR.Kernel trainer 不直接生成单段文本，而是把每个 rollout sample 交给 `ClawContainerAgentLoop`，由它启动一个 container。container 内的 `claw_react_loop.py` 多次调用 `claw prompt`，每轮自动抽取 `solution.py` 或最后一个 `class ModelNew` 代码块，调用 KernelGYM 得到 compile/correctness/speedup feedback，再把 feedback 塞进下一轮 prompt。最后把 `claw_react_transcript.jsonl` 重新渲染并 tokenize 成训练样本。
 
 ## 端到端流程
 
@@ -38,12 +38,12 @@ DR.Kernel trainer 不直接生成单段文本，而是把每个 rollout sample �
 3. `AgentLoopWorker` 收到一个 rollout sample 后，把它路由到 `ClawContainerAgentLoop`。
 4. `ClawContainerAgentLoop` 为这个 sample 建 workspace，写 prompt 和 container entrypoint。
 5. 宿主机执行 `docker run --rm --network host -v <workspace>:/workspace ... claw-agent-runtime:latest`。
-6. container 内先启动 OpenAI-compatible proxy，再执行 `claw --output-format json ... prompt "$PROMPT"`。
-7. Claw 每次需要模型输出时，请求 container 内 proxy；proxy 根据剩余 token budget 限制 `max_tokens`，再转发给训练侧 vLLM。
-8. Claw 退出后，host 侧读取 `claw_result.json`、`claw_stderr.log` 和 `.claw/sessions/*.jsonl`。
-9. 代码把 Claw session 里的 assistant/tool 轨迹渲染为训练 response，并按 tokenizer/chat template 做增量 tokenize。
-10. `AgentLoopOutput` 返回 `response_ids`、`response_mask`、`loss_mask`、`turn_indices` 等字段。
-11. DR.Kernel reward manager decode response，调用 KernelGYM evaluate，返回 reward tensor 和 extra metrics。
+6. container 内先启动 OpenAI-compatible proxy，再执行 `python3 /workspace/claw_react_loop.py`。
+7. `claw_react_loop.py` 每轮调用 `claw --output-format json ... prompt <turn_prompt>`；Claw 需要模型输出时经由 proxy 请求训练侧 vLLM。
+8. 每轮 Claw 结束后，entrypoint 优先读 `/workspace/solution.py`，否则从 assistant 文本最后一个 Python code block 抽取 `class ModelNew`。
+9. entrypoint 调 `/workspace/kernelgym_evaluate.py` POST 到 `KERNELGYM_SERVER_URL/evaluate`，得到 compile/correctness/speedup/error feedback。
+10. feedback 作为下一轮 user prompt 写回 Claw；同时写入 `claw_react_transcript.jsonl`，其中 assistant token 可训练、feedback token 不训练。
+11. 最后一轮 eval 的 reward/metrics 写入 `react_summary.json`，host 侧直接回填 `AgentLoopOutput.reward_score`，避免混合 transcript 被 reward manager 错误截断。
 12. Trainer 用这些 rollout batch 做 PPO/update/save/eval。
 
 ## 关键文件清单
@@ -51,8 +51,10 @@ DR.Kernel trainer 不直接生成单段文本，而是把每个 rollout sample �
 | 文件 | 改动作用 |
 | --- | --- |
 | [../../../verl_patch/experimental/agent_loop/claw_container_agent.py](../../../verl_patch/experimental/agent_loop/claw_container_agent.py) | 新增 `ClawContainerAgentLoop`，负责每个 sample 一个 docker container、Claw 启动、proxy 转发、session 读取、轨迹 tokenize、返回 `AgentLoopOutput`。 |
+| [../../../verl_patch/experimental/agent_loop/claw_react_loop.py](../../../verl_patch/experimental/agent_loop/claw_react_loop.py) | container 内强制 ReAct loop：调用 Claw、抽取候选代码、调用 KernelGYM、生成下一轮 feedback prompt、写 transcript/summary。 |
+| [../../../verl_patch/experimental/agent_loop/kernelgym_evaluate.py](../../../verl_patch/experimental/agent_loop/kernelgym_evaluate.py) | container 内 KernelGYM evaluate 客户端；只依赖 Python 标准库，读取 host 写入的 hidden reference context。 |
 | [../../../verl_patch/experimental/agent_loop/__init__.py](../../../verl_patch/experimental/agent_loop/__init__.py) | import `ClawContainerAgentLoop`，让 `@register("claw_container")` 生效。 |
-| [../../../verl_patch/experimental/agent_loop/agent_loop.py](../../../verl_patch/experimental/agent_loop/agent_loop.py) | 增加 `default_agent_name` fallback，不需要改 parquet schema 也能强制全量样本走 `claw_container`；同时补齐 sample-level loss/turn metadata。 |
+| [../../../verl_patch/experimental/agent_loop/agent_loop.py](../../../verl_patch/experimental/agent_loop/agent_loop.py) | 增加 `default_agent_name` fallback，不需要改 parquet schema 也能强制全量样本走 `claw_container`；当 agent loop 已经给出 `reward_score` 时直接生成 `token_level_scores` 并透传 `reward_extra_info`。 |
 | [../../kernel_trainer.py](../../kernel_trainer.py) | 在 `async_agent` 路径初始化 `AgentLoopManager`；补 `ensure_sample_loss_mask`；兼容缺失 rollout logprobs 的分支；在 reward loss mask 前保证 sample mask 存在。 |
 | [../../workers/reward_manager/kernel_async.py](../../workers/reward_manager/kernel_async.py) | 让 reward manager 支持 `DataProto` 输入，逐样本 decode response 并复用原来的 KernelGYM evaluate 逻辑，同时收集 numeric extra_info。 |
 | [8b_claw_container_agent_local.sh](8b_claw_container_agent_local.sh) | Claw container-agent 训练 launcher，设置 async agent、GPU 4-7、rollout/training 超参、checkpoint 保留策略和 Claw 相关 env。 |
@@ -72,8 +74,8 @@ DR.Kernel trainer 不直接生成单段文本，而是把每个 rollout sample �
 | --- | --- |
 | env knobs | 读取 `CLAW_AGENT_IMAGE`、`CLAW_WORKSPACE_ROOT`、`CLAW_MAX_COMPLETION_TOKENS`、`CLAW_CONCURRENCY`、`CLAW_AGENT_TIMEOUT_SEC` 等环境变量。 |
 | `OPENAI_COMPAT_PROXY_SCRIPT` | 写进 container 的本地 proxy。它接收 Claw 的 OpenAI-compatible 请求，限制剩余 completion token，再转发给训练侧 vLLM。 |
-| `_container_entrypoint_script` | container 内入口脚本。启动 proxy，设置 `OPENAI_BASE_URL`，执行 `claw --output-format json --permission-mode danger-full-access --dangerously-skip-permissions --model "$CLAW_MODEL" prompt "$PROMPT"`。 |
-| `_load_latest_session` | 读取 workspace 下最新 `.claw/sessions/*.jsonl`，拿到 Claw 实际对话轨迹。 |
+| `_container_entrypoint_script` | container 内入口脚本。启动 proxy，设置 `OPENAI_BASE_URL`，执行 `python3 /workspace/claw_react_loop.py`。 |
+| `_load_session_messages` | 优先读取 `claw_react_transcript.jsonl`；如果没有，再回退到最新 `.claw/sessions/*.jsonl`。 |
 | `_render_claw_turns` | 把 Claw session message 转成训练侧可 tokenize 的 role/content turn，包含 tool_use/tool_result 的文本化。 |
 | `_run_claw_container_blocking` | host 侧实际执行 docker container，处理 timeout、kill、stdout/stderr 和 artifact 路径。 |
 | `ClawContainerAgentLoop.run` | 单个 rollout sample 的总控：准备 prompt、启动 container、读取 artifacts、构造 response/tokens/masks/metadata。 |
@@ -92,6 +94,8 @@ DR.Kernel trainer 不直接生成单段文本，而是把每个 rollout sample �
 | `MAX_RESPONSE_LENGTH` | `8192` | trainer 侧最大 response token。 |
 | `CLAW_MAX_COMPLETION_TOKENS` | `8192` | container proxy 对单个 sample 的 completion token budget。 |
 | `CLAW_CONCURRENCY` | `8` | 同时运行的 Claw container 数。 |
+| `CLAW_REACT_MAX_TURNS` | `3` | container 内强制 ReAct turn 数；默认跟 `MAX_TURN` 对齐。 |
+| `CLAW_REACT_STOP_ON_OK` | `false` | 是否在某轮 KernelGYM 已正确时提前停止；默认继续尝试优化。 |
 | `SP_SIZE` | `4` | actor sequence parallel size。 |
 | `ROLLOUT_GPU_MEMORY_UTIL` | `0.75` | vLLM GPU memory utilization。 |
 | `VAL_BEFORE_TRAIN` | `True` | 训练前先跑 validation，所以启动早期会看到大量 eval containers。 |
@@ -114,16 +118,23 @@ ${CLAW_WORKSPACE_ROOT:-$ROOT_DIR/tmp/claw_drkernel_rollouts}/claw-drkernel-*
 | `prompt.txt` | host 写入 | 给 Claw 的任务输入。 |
 | `entrypoint.sh` | host 写入 | container 内执行脚本。 |
 | `openai_proxy.py` | host 写入 | container 内 proxy 代码。 |
+| `claw_react_loop.py` | host 写入 | container 内强制多轮 ReAct 控制器。 |
+| `kernelgym_evaluate.py` | host 写入 | container 内 KernelGYM evaluate 客户端。 |
+| `kernelgym_context.json` | host 写入 | hidden reference、entry point、uuid 等 evaluate 所需上下文。 |
+| `claw_react_transcript.jsonl` | entrypoint 写入 | 训练轨迹主来源；记录 user prompt、assistant output、KernelGYM feedback。 |
+| `react_summary.json` | entrypoint 写入 | 最后一轮 eval、reward_score、reward_extra_info。 |
 | `claw_result.json` | Claw CLI 输出 | 优先提取最终 message。 |
 | `claw_stderr.log` | Claw CLI stderr | debug Claw 失败原因。 |
-| `.claw/sessions/*.jsonl` | Claw runtime 写入 | 训练轨迹主来源，记录 assistant/tool 对话。 |
+| `.claw/sessions/*.jsonl` | Claw runtime 写入 | fallback/debug 来源；正式训练优先用 `claw_react_transcript.jsonl`。 |
 | `openai_proxy.log` | proxy 写入 | debug vLLM 请求、budget 和错误。 |
 
 训练侧不是凭空构造 response，而是等 container 退出后读这些 artifacts。优先级是:
 
-1. 用 `claw_result.json` 里的最终 message 当最终文本。
-2. 如果没有最终 message，则回退到 session 里最后一条 assistant message。
-3. 如果 session 也不可用，则用 failure reason 生成一个可训练/可打分的失败 response。
+1. 优先用 `claw_react_transcript.jsonl` 作为训练 trajectory。
+2. 用 `react_summary.json` 里的最后一轮 evaluation 作为 reward/metrics。
+3. 用 `claw_result.json` 里的最终 message 当最终文本 fallback。
+4. 如果没有最终 message，则回退到 transcript/session 里最后一条 assistant message。
+5. 如果 session 也不可用，则用 failure reason 生成一个失败 response。
 
 ## Tool call 和 context compression
 

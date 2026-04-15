@@ -244,7 +244,8 @@ if __name__ == "__main__":
 def _container_entrypoint_script() -> str:
     return (
         "set -euo pipefail\n"
-        "mkdir -p /workspace/home\n"
+        "mkdir -p /workspace/home/.claw\n"
+        "export CLAW_CONFIG_HOME=/workspace/home/.claw\n"
         "python3 /workspace/openai_compat_proxy.py > /workspace/openai_proxy.log 2>&1 &\n"
         "PROXY_PID=$!\n"
         "for _ in $(seq 1 80); do\n"
@@ -252,17 +253,10 @@ def _container_entrypoint_script() -> str:
         "  sleep 0.1\n"
         "done\n"
         "export OPENAI_BASE_URL=http://127.0.0.1:${OPENAI_PROXY_PORT}/v1\n"
-        "PROMPT=$(cat /workspace/prompt.txt)\n"
         "set +e\n"
-        "claw \\\n"
-        "  --output-format json \\\n"
-        "  --permission-mode danger-full-access \\\n"
-        "  --dangerously-skip-permissions \\\n"
-        "  --model \"$CLAW_MODEL\" \\\n"
-        "  prompt \"$PROMPT\" \\\n"
-        "  > /workspace/claw_result.json \\\n"
-        "  2> /workspace/claw_stderr.log\n"
+        "python3 /workspace/claw_react_loop.py > /workspace/claw_react_stdout.log 2> /workspace/claw_stderr.log\n"
         "CLAW_EXIT=$?\n"
+        "chmod -R a+rwX /workspace >/dev/null 2>&1 || true\n"
         "kill $PROXY_PID >/dev/null 2>&1 || true\n"
         "exit $CLAW_EXIT\n"
     )
@@ -278,9 +272,71 @@ class _ClawArtifacts:
     exit_code: int
     workspace_dir: Path
     result_json: Optional[dict] = None
+    react_summary: Optional[dict] = None
     session_messages: list[dict] = field(default_factory=list)
     stderr_text: str = ""
     failure_reason: Optional[str] = None
+
+
+@dataclass
+class _KernelGymContext:
+    reference_code: str = ""
+    entry_point: str = "Model"
+    uuid: str = ""
+    data_source: str = ""
+    is_valid: bool = False
+
+
+def _support_script_text(filename: str) -> str:
+    return (Path(__file__).resolve().parent / filename).read_text(encoding="utf-8")
+
+
+def _coerce_mapping(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "item") and not isinstance(value, (str, bytes, bytearray)):
+        try:
+            return _coerce_mapping(value.item())
+        except Exception:
+            pass
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _string_or_empty(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "item") and not isinstance(value, (str, bytes, bytearray)):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    return str(value)
+
+
+def _infer_entry_point(reference_code: str, default: str = "Model") -> str:
+    if not reference_code:
+        return default
+    marker = "class "
+    start = reference_code.find(marker)
+    if start < 0:
+        return default
+    start += len(marker)
+    end = start
+    while end < len(reference_code) and (reference_code[end].isalnum() or reference_code[end] == "_"):
+        end += 1
+    candidate = reference_code[start:end].strip()
+    return candidate or default
 
 
 def _latest_session_file(workspace_dir: Path) -> Optional[Path]:
@@ -293,12 +349,9 @@ def _latest_session_file(workspace_dir: Path) -> Optional[Path]:
     return max(session_files, key=lambda p: p.stat().st_mtime)
 
 
-def _load_session_messages(workspace_dir: Path) -> list[dict]:
-    session_file = _latest_session_file(workspace_dir)
-    if session_file is None:
-        return []
+def _load_jsonl_messages(path: Path) -> list[dict]:
     messages: list[dict] = []
-    with session_file.open("r", encoding="utf-8") as handle:
+    with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
             if not line:
@@ -310,6 +363,22 @@ def _load_session_messages(workspace_dir: Path) -> list[dict]:
             if record.get("type") == "message" and isinstance(record.get("message"), dict):
                 messages.append(record["message"])
     return messages
+
+
+def _load_session_messages(workspace_dir: Path) -> list[dict]:
+    react_transcript = workspace_dir / "claw_react_transcript.jsonl"
+    if react_transcript.exists():
+        try:
+            messages = _load_jsonl_messages(react_transcript)
+            if messages:
+                return messages
+        except Exception:
+            pass
+
+    session_file = _latest_session_file(workspace_dir)
+    if session_file is None:
+        return []
+    return _load_jsonl_messages(session_file)
 
 
 def _block_text(block: dict) -> str:
@@ -517,11 +586,50 @@ class ClawContainerAgentLoop(AgentLoopBase):
         cls.claw_model = os.getenv("CLAW_MODEL_NAME", cls.model_name)
         cls.openai_api_key = os.getenv("CLAW_OPENAI_API_KEY", "local-dev-token")
         cls.explicit_upstream = os.getenv("CLAW_UPSTREAM_BASE_URL") or None
+        cls.react_max_turns = int(os.getenv("CLAW_REACT_MAX_TURNS", str(cls.max_user_turns or 3)))
+        cls.react_stop_on_ok = os.getenv("CLAW_REACT_STOP_ON_OK", "false")
+        cls.kernelgym_server_url = os.getenv("KERNELGYM_SERVER_URL", "http://127.0.0.1:10907")
+        cls.kernelgym_task_timeout = int(
+            os.getenv("CLAW_KERNELGYM_TASK_TIMEOUT", str(getattr(config.reward_model, "task_timeout", 300)))
+        )
+        cls.kernelgym_task_timeout_client = int(
+            os.getenv(
+                "CLAW_KERNELGYM_TASK_TIMEOUT_CLIENT",
+                str(getattr(config.reward_model, "task_timeout_in_client", 2400)),
+            )
+        )
+        cls.kernelgym_num_correct_trials = int(
+            os.getenv("CLAW_KERNELGYM_NUM_CORRECT_TRIALS", str(getattr(config.reward_model, "num_correct_trials", 5)))
+        )
+        cls.kernelgym_num_perf_trials = int(
+            os.getenv("CLAW_KERNELGYM_NUM_PERF_TRIALS", str(getattr(config.reward_model, "num_perf_trials", 20)))
+        )
+        cls.kernelgym_reference_backend = os.getenv(
+            "REFERENCE_BACKEND", os.getenv("KERNELGYM_REFERENCE_BACKEND", str(getattr(config.reward_model, "reference_backend", "pytorch")))
+        )
+        cls.kernelgym_speedup_upper = os.getenv(
+            "SPEEDUP_REWARD_UPPER_BOUND", str(getattr(config.reward_model, "speedup_reward_upper_bound", 3.0))
+        )
+        cls.kernelgym_speedup_lower = os.getenv(
+            "SPEEDUP_REWARD_LOWER_BOUND", str(getattr(config.reward_model, "speedup_reward_lower_bound", 0.0))
+        )
+        coverage_cfg = getattr(config.reward_model, "coverage_reward", {})
+        cls.kernelgym_coverage_enable = os.getenv("COVERAGE_REWARD_ENABLE", str(getattr(coverage_cfg, "enable", False)))
+        cls.kernelgym_coverage_weight = os.getenv("COVERAGE_REWARD_WEIGHT", str(getattr(coverage_cfg, "weight", 0.5)))
+        cls.kernelgym_coverage_type = os.getenv("COVERAGE_REWARD_TYPE", str(getattr(coverage_cfg, "reward_type", "time_coverage")))
+        cls.kernelgym_init_correct_weight = str(getattr(config.reward_model, "init_correct_weight", 0.5))
+        cls.kernelgym_init_performance_weight = str(getattr(config.reward_model, "init_performance_weight", 0.5))
+        cls.kernelgym_speedup_eps = str(getattr(config.reward_model, "speedup_eps", 0.01))
+        try:
+            cls.kernelgym_penalty_score = str(config.reward_model.reward_policy.penalties.penalty_score)
+        except Exception:
+            cls.kernelgym_penalty_score = "0.0"
 
         logger.info(
-            "ClawContainerAgentLoop config image=%s workspace=%s network=%s budget=%d model=%s upstream_override=%s",
+            "ClawContainerAgentLoop config image=%s workspace=%s network=%s budget=%d model=%s react_turns=%d kernelgym=%s upstream_override=%s",
             cls.image, cls.workspace_root, cls.container_network,
-            cls.completion_budget_tokens, cls.claw_model, cls.explicit_upstream,
+            cls.completion_budget_tokens, cls.claw_model, cls.react_max_turns,
+            cls.kernelgym_server_url, cls.explicit_upstream,
         )
 
     async def _resolve_upstream(self) -> str:
@@ -558,17 +666,70 @@ class ClawContainerAgentLoop(AgentLoopBase):
         task = "\n".join(p for p in parts if p).strip()
         return task
 
-    def _prepare_workspace(self, task_prompt: str) -> Path:
+    def _build_kernelgym_context(self, kwargs: dict[str, Any]) -> _KernelGymContext:
+        reward_model = _coerce_mapping(kwargs.get("reward_model"))
+        extra_info = _coerce_mapping(kwargs.get("extra_info"))
+        reference_code = (
+            _string_or_empty(kwargs.get("ground_truth"))
+            or _string_or_empty(reward_model.get("ground_truth"))
+            or _string_or_empty(extra_info.get("ground_truth"))
+        )
+        entry_point = (
+            _string_or_empty(kwargs.get("entry_point"))
+            or _string_or_empty(extra_info.get("entry_point"))
+            or _infer_entry_point(reference_code)
+        )
+        task_uuid = (
+            _string_or_empty(kwargs.get("uuid"))
+            or _string_or_empty(extra_info.get("uuid"))
+            or _string_or_empty(extra_info.get("problem_id"))
+            or _string_or_empty(kwargs.get("uid"))
+            or uuid.uuid4().hex
+        )
+        data_source = _string_or_empty(kwargs.get("data_source")) or _string_or_empty(extra_info.get("data_source"))
+        is_valid = str(data_source).lower().startswith(("val", "valid", "test"))
+        return _KernelGymContext(
+            reference_code=reference_code,
+            entry_point=entry_point or "Model",
+            uuid=task_uuid,
+            data_source=data_source,
+            is_valid=is_valid,
+        )
+
+    def _prepare_workspace(self, task_prompt: str, kernelgym_context: _KernelGymContext) -> Path:
         workspace_dir = Path(tempfile.mkdtemp(prefix="claw-drkernel-", dir=self.workspace_root))
         (workspace_dir / "prompt.txt").write_text(
             "You are Claw Code running inside a throwaway workspace container.\n"
             "You may inspect files and use tools such as bash, read, write, edit, grep, and glob.\n"
-            "Solve the kernel-authoring task below, producing a final CUDA kernel answer.\n\n"
+            "The rollout harness will run a ReAct loop for you: after each answer it extracts your "
+            "candidate code, evaluates it with KernelGYM, then sends the feedback back as the next "
+            "prompt. You do not need to emit OpenAI tool calls.\n"
+            "On every turn, write the complete candidate to /workspace/solution.py when possible and "
+            "include the same complete Python code block in your answer. The code must define "
+            "class ModelNew. Repair correctness first, then optimize speed.\n\n"
             f"Task:\n{task_prompt}\n",
             encoding="utf-8",
         )
         (workspace_dir / "TASK.md").write_text(f"# Task\n\n{task_prompt}\n", encoding="utf-8")
         (workspace_dir / "openai_compat_proxy.py").write_text(OPENAI_COMPAT_PROXY_SCRIPT, encoding="utf-8")
+        (workspace_dir / "claw_react_loop.py").write_text(_support_script_text("claw_react_loop.py"), encoding="utf-8")
+        (workspace_dir / "kernelgym_evaluate.py").write_text(_support_script_text("kernelgym_evaluate.py"), encoding="utf-8")
+        (workspace_dir / "claw_react_loop.py").chmod(0o755)
+        (workspace_dir / "kernelgym_evaluate.py").chmod(0o755)
+        (workspace_dir / "kernelgym_context.json").write_text(
+            json.dumps(
+                {
+                    "reference_code": kernelgym_context.reference_code,
+                    "entry_point": kernelgym_context.entry_point,
+                    "uuid": kernelgym_context.uuid,
+                    "data_source": kernelgym_context.data_source,
+                    "is_valid": kernelgym_context.is_valid,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         return workspace_dir
 
     def _tokenize_turn_delta(self, turns_so_far: list[tuple[str, str]], new_turn: tuple[str, str]) -> list[int]:
@@ -596,6 +757,27 @@ class ClawContainerAgentLoop(AgentLoopBase):
             "OPENAI_PROXY_PORT": str(proxy_port),
             "OPENAI_PROXY_COMPLETION_BUDGET_TOKENS": str(self.completion_budget_tokens),
             "CLAW_MODEL": self.claw_model,
+            "CLAW_REACT_MAX_TURNS": str(self.react_max_turns),
+            "CLAW_REACT_STOP_ON_OK": str(self.react_stop_on_ok),
+            "KERNELGYM_SERVER_URL": self.kernelgym_server_url,
+            "KERNELGYM_CONTEXT_PATH": "/workspace/kernelgym_context.json",
+            "KERNELGYM_WORKSPACE_DIR": "/workspace",
+            "KERNELGYM_EVAL_COUNTER_PATH": "/workspace/kernelgym_eval_count.txt",
+            "KERNELGYM_MAX_EVALS_PER_SAMPLE": str(self.react_max_turns),
+            "KERNELGYM_TASK_TIMEOUT": str(self.kernelgym_task_timeout),
+            "KERNELGYM_TASK_TIMEOUT_CLIENT": str(self.kernelgym_task_timeout_client),
+            "KERNELGYM_NUM_CORRECT_TRIALS": str(self.kernelgym_num_correct_trials),
+            "KERNELGYM_NUM_PERF_TRIALS": str(self.kernelgym_num_perf_trials),
+            "KERNELGYM_REFERENCE_BACKEND": self.kernelgym_reference_backend,
+            "KERNELGYM_SPEEDUP_REWARD_UPPER_BOUND": str(self.kernelgym_speedup_upper),
+            "KERNELGYM_SPEEDUP_REWARD_LOWER_BOUND": str(self.kernelgym_speedup_lower),
+            "KERNELGYM_COVERAGE_REWARD_ENABLE": str(self.kernelgym_coverage_enable),
+            "KERNELGYM_COVERAGE_REWARD_WEIGHT": str(self.kernelgym_coverage_weight),
+            "KERNELGYM_COVERAGE_REWARD_TYPE": str(self.kernelgym_coverage_type),
+            "KERNELGYM_INIT_CORRECT_WEIGHT": str(self.kernelgym_init_correct_weight),
+            "KERNELGYM_INIT_PERFORMANCE_WEIGHT": str(self.kernelgym_init_performance_weight),
+            "KERNELGYM_SPEEDUP_EPS": str(self.kernelgym_speedup_eps),
+            "KERNELGYM_REWARD_PENALTY_SCORE": str(self.kernelgym_penalty_score),
             "HOME": "/workspace/home",
         }
         exit_code, failure = await asyncio.to_thread(
@@ -616,6 +798,15 @@ class ClawContainerAgentLoop(AgentLoopBase):
                     result_json = json.loads(raw)
                 except Exception:
                     pass
+        react_summary = None
+        summary_path = workspace_dir / "react_summary.json"
+        if summary_path.exists():
+            raw = summary_path.read_text(encoding="utf-8").strip()
+            if raw:
+                try:
+                    react_summary = json.loads(raw)
+                except Exception:
+                    pass
         stderr_text = ""
         stderr_path = workspace_dir / "claw_stderr.log"
         if stderr_path.exists():
@@ -628,6 +819,7 @@ class ClawContainerAgentLoop(AgentLoopBase):
             exit_code=int(exit_code),
             workspace_dir=workspace_dir,
             result_json=result_json,
+            react_summary=react_summary,
             session_messages=session_messages,
             stderr_text=stderr_text,
             failure_reason=failure_reason,
@@ -653,8 +845,13 @@ class ClawContainerAgentLoop(AgentLoopBase):
         _dbg("step 2: resolve upstream")
         upstream_url = await self._resolve_upstream()
         task_prompt = self._build_task_prompt_text(messages)
-        workspace_dir = await self.loop.run_in_executor(None, self._prepare_workspace, task_prompt)
-        _dbg(f"step 2 done: upstream={upstream_url} workspace={workspace_dir}")
+        kernelgym_context = self._build_kernelgym_context(kwargs)
+        workspace_dir = await self.loop.run_in_executor(None, self._prepare_workspace, task_prompt, kernelgym_context)
+        _dbg(
+            "step 2 done: upstream={} workspace={} entry_point={} has_ref={}".format(
+                upstream_url, workspace_dir, kernelgym_context.entry_point, bool(kernelgym_context.reference_code)
+            )
+        )
 
         sample_index = int(kwargs.get("index", 0)) if kwargs.get("index") is not None else 0
 
@@ -717,11 +914,40 @@ class ClawContainerAgentLoop(AgentLoopBase):
             response_ids = [self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0]
             response_mask = [0]
 
+        reward_score = 0.0
+        reward_extra_info: dict[str, Any] = {
+            "correctness": False,
+            "performance": 0.0,
+            "is_speedup_positive": False,
+            "is_decoy_kernel": False,
+            "compilation": False,
+            "success": False,
+            "status": "missing_react_summary",
+            "error": artifacts.failure_reason or "",
+            "num_custom_kernel": 0.0,
+            "num_total_kernels": 0.0,
+            "num_coverage": 0.0,
+            "time_coverage": 0.0,
+            "react_turn": 0,
+            "react_reward": 0.0,
+        }
+        if isinstance(artifacts.react_summary, dict):
+            raw_reward = artifacts.react_summary.get("reward_score")
+            if raw_reward is not None:
+                try:
+                    reward_score = float(raw_reward)
+                except Exception:
+                    reward_score = 0.0
+            raw_extra = artifacts.react_summary.get("reward_extra_info")
+            if isinstance(raw_extra, dict):
+                reward_extra_info = raw_extra
+
         return AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
             response_mask=response_mask[: self.response_length],
             response_logprobs=None,
+            reward_score=reward_score,
             multi_modal_data={},
             num_turns=len(turns) + 1,
             metrics=metrics,
@@ -730,5 +956,6 @@ class ClawContainerAgentLoop(AgentLoopBase):
                 "claw_exit_code": artifacts.exit_code,
                 "claw_failure": artifacts.failure_reason or "",
                 "claw_final_message": final_message,
+                "reward_extra_info": reward_extra_info,
             },
         )
